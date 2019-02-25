@@ -1,3 +1,6 @@
+#pragma once
+
+#include <stdio.h>
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <rdma/rdma_cma.h>
@@ -14,6 +17,8 @@
 
 #define BUFFER_SIZE = 1024;
 
+#define VERB_ERR(verb, ret) \
+fprintf(stderr, "%s returned %d errno %d\n", verb, ret, errno)
 
 typedef struct client {
 	uint64_t pgid;
@@ -26,7 +31,7 @@ typedef struct clientList {
 	struct clientList *tail;
 } clientList;
 
-static clientList *clientList(client *head, clientList *tail) {
+clientList *ClientList(client *head, clientList *tail) {
 	clientList *cl = calloc(1, sizeof(clientList));
 	cl->head = head;
 	cl->tail = tail;
@@ -42,4 +47,57 @@ typedef struct connection {
 
 	char *clientList_buff;
 	struct ibv_mr *clientList_mr;
+
+	char *sync_buff;
+	struct ibv_mr *sync_mr;
 } connection;
+
+typedef struct connectionList {
+	connection *head;
+	struct connectionList *tail;
+} connectionList;
+
+connectionList *ConnectionList(connection *head, connectionList *tail) {
+	connectionList *cl = calloc(1, sizeof(connectionList));
+	cl->head = head;
+	cl->tail = tail;
+	return cl;
+}
+
+struct mcontext {
+	/* User parameters */
+	int sender;
+	char *bind_addr;
+	char *mcast_addr;
+	char *server_port;
+	int msg_count;
+	int msg_length;
+	/* Resources */
+	struct sockaddr mcast_sockaddr;
+	struct rdma_cm_id *id;
+	struct rdma_event_channel *channel;
+	struct ibv_pd *pd;
+	struct ibv_cq *cq;
+	struct ibv_mr *mr;
+	char *buf;
+	struct ibv_ah *ah;
+	uint32_t remote_qpn;
+	uint32_t remote_qkey;
+	pthread_t cm_thread;
+};
+
+
+int mcast();
+
+int resolve_addr(struct mcontext *ctx);
+
+int on_event(struct rdma_cm_event *event);
+int on_addr_resolved(struct rdma_cm_id *id)
+int on_route_resolved(struct rdma_cm_id *id);
+int on_connect_request(struct rdma_cm_id *id);
+int on_connection(void *context);
+int on_disconnect(struct rdma_cm_id *id);
+
+int get_completion(struct ibv_cq *cq);
+void on_completion(struct ibv_wc *wc);
+
