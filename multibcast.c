@@ -1,4 +1,4 @@
-#include "multibcastHeader.h"
+#include "multibcast.h"
 #include <stdio.h>
 
 int main() {
