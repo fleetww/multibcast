@@ -52,6 +52,9 @@ clientList *ClientList(client *head, clientList *tail) {
 clientList *clients = NULL;
 
 client *myclient = NULL:
+uint64_t mygid;
+uint16_t comm_no = 0;
+uint32_t numm=0;
 
 struct rdma_event_channel *event_channel;
 
@@ -86,8 +89,19 @@ typedef struct connection {
 	char *clientList_buff;
 	struct ibv_mr *clientList_mr;
 
-	uint8_t *sync_buff;
+	uint16_t *sync_buff;
 	struct ibv_mr *sync_mr;
+
+	enum {
+		RS_INIT,
+		RS_SIZE,
+		RS_LIST
+	} recv_state;
+	enum {
+		SS_INIT,
+		SS_SIZE,
+		SS_LIST
+	} send_state;
 } connection;
 
 typedef struct connectionList {
@@ -101,6 +115,8 @@ connectionList *ConnectionList(connection *head, connectionList *tail) {
 	cl->tail = tail;
 	return cl;
 }
+
+connectionList *connections = NULL;
 
 struct mcontext {
 	/* User parameters */
@@ -137,12 +153,20 @@ int on_disconnect(struct rdma_cm_id *id);
 
 int get_completion(struct ibv_cq *cq);
 void on_completion(struct ibv_wc *wc);
+void coord_recv_completion(struct ibv_wc *wc);
+void client_recv_completion(struct ibv_wc *wc);
 
-void * poll_cq_fn(void *arg);
+void *poll_cq_fn(void *arg);
 
 void build_context(struct ibv_context *verbs);
 void build_qp_attr(struct ibv_qp_init_attr *qp_attr);
 void register_memory(connection *conn);
+void printmultiple(connection *conn);
+void post_receives();
+void post_client_list_size_send();
+void post_client_list_send(connection *conn);
+
+void mcast();
 
 void become_coord();
 void init_coord_connection();

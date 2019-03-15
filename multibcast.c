@@ -100,6 +100,7 @@ int on_addr_resolved(struct rdma_cm_id *id) {
 	conn->qp = id->qp;
 
 	register_memory(conn);
+	post_client_list_size_recv(conn);
 
 	return 0;
 }
@@ -145,17 +146,32 @@ void register_memory(connection *conn) {
 				sizeof(uint64_t),
 				IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
 
-	conn->sync_buff = malloc(sizeof(uint8_t));
+	conn->sync_buff = malloc(sizeof(uint16_t));
 	TEST_Z(conn->sync_mr = ibv_reg_mr(
 				coord_ctx->pd,
 				conn->sync_buff,
-				sizeof(uint8_t),
+				sizeof(uint16_t),
 				IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
+}
+
+void post_client_list_size_recv(connection *conn) {
+	struct ibv_recv_wr wr, *bad_wr = NULL;
+	struct ibv_sge sge;
+
+	wr.wr_id = (uintptr_t) conn;
+	wr.next = NULL;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+
+	sge.addr = (uintptr_t) conn->clientList_size_buff;
+	sge.length = sizeof(uint64_t);
+	sge.lkey = conn->clientList_size_mr->lkey;
+
+	TEST_NZ(ibv_post_recv(conn->qp, &wr, &bad_wr));
 }
 
 int on_route_resolved(struct rdma_cm_id *id) {
 	struct rdma_conn_param cm_params;
-
 
 	memset(&cm_params, 0, sizeof(struct rdma_conn_param));
 	TEST_NZ(rdma_connect(id, &cm_params));
@@ -167,8 +183,7 @@ int on_route_resolved(struct rdma_cm_id *id) {
 
 bool first = true;
 int on_connect_request(struct rdma_cm_id *id) {
-	struct ibv_qp_init_attr qp_attr;
-	struct rdma_conn_param cm_params;
+	numm = 0;
 
 	struct sockaddr_in * addr_in = (struct sockaddr_in *) rdma_get_peer_addr(id);
 	char ipstr[INET_ADDRSTRLEN];
@@ -183,7 +198,7 @@ int on_connect_request(struct rdma_cm_id *id) {
 
 		uint64_t if_id1 = id->route.addr.addr.ibaddr.sgid.global.interface_id;//the worst reference ever! lol
 		c->pgid = if_id1;
-		c->cnum = htons(comm_no++);
+		c->rank = htons(comm_no++); //comm_no starts at 0
 		c->ip_addr = id->route.addr.src_sin;
 
 		memcpy(&myclient->pgid, &c->pgid,sizeof(uint64_t));
@@ -197,22 +212,149 @@ int on_connect_request(struct rdma_cm_id *id) {
 
 	client *cl = (client *) malloc(sizeof(client));
 	cl->pgid = id->route.addr.addr.ibaddr.dgid.global.interface_id;
-	cl->cnum = htons(comm_no);
+	cl->rank = htons(comm_no++);
 	cl->ip_addr = id->route.addr.dst_sin;
+
+	build_context(id->verbs);
+	struct ibv_qp_init_attr qp_attr;
+	build_qp_attr(&qp_attr);
+
+	TEST_NZ(rdma_create_qp(id, coord_ctx->pd, &qp_attr));
+	connection conn = (connection *) malloc(sizeof(connection));
+	id->context = conn;
+	conn->cm_id = id;
+	conn->qp = id->qp;
+	conn->conn_id = comm_no;
+	conn->send_state = SS_INIT;
+	conn->recv_state = RS_INIT;
+
+	uint16_t cl_size = comm_no * sizeof(client);
+	if (comm_no == 2) {//first connection made
+		conn->clientList_size_buff = malloc(sizeof(uint16_t));
+		TEST_Z(conn->clientList_size_mr = ibv_reg_mr(
+					coord_ctx->pd,
+					conn->clientList_size_buff,
+					sizeof(uint16_t),
+					IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
+
+		conn->clientList_buff = malloc(cl_size);
+		TEST_Z(conn->clientList_buff_mr = ibv_reg_mr(
+					coord_ctx->pd,
+					conn->clientList_buff,
+					cl_size,
+					IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_LOCAL_WRITE));
+
+	conn->sync_buff = malloc(sizeof(uint16_t));
+	TEST_Z(conn->sync_mr = ibv_reg_mr(
+				coord_ctx->pd,
+				conn->sync_buff,
+				sizeof(uint16_t),
+				IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
+	} else {
+		conn->clientList_buff = realloc(clientList_buff, cl_size);
+
+		ibv_dereg_mr(conn->clientList_buff_mr);
+
+		TEST_Z(conn->clientList_buff_mr = ibv_reg_mr(
+					coord_ctx->pd,
+					conn->clientList_buff,
+					cl_size,
+					IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_LOCAL_WRITE));
+	}
+
+	clients = ClientList(cl, clients);
+	int i = 0;
+	for (clientList *clt = clients; clt; clt = clt->tail) {
+		client cc = clt->head;
+		memcpy(clientList_buff + (i * sizeof(client)), cc, sizeof(client));
+		i++;
+	}
+
+	connections = ConnectionList(conn, connections);
+	*(conn->clientList_size_buff) = htons(comm_no);
+	printmultiple(conn);
+	post_sync_msg_receives();
+
+	struct rdma_conn_param cm_params;
+	memset(&cm_params, 0, sizeof(rdma_conn_param));
+
+	TEST_NZ(rdma_accept(id, &cm_params));
 
 	return 0;
 }
 
-int on_connection(struct rdma_cm_id *id) {
-	struct sockaddr_in * addr_in = (struct sockaddr_in *) rdma_get_peer_addr(id);
+void post_sync_msg_receives() {
+	for (connectionList *clt = connections; clt; clt = clt->tail) {
+		connection *conn = clt->head;
+		struct ibv_recv_wr wr, *bad_wr = NULL;
+		struct ibv_sge sge;
 
+		wr.wr_id = (uintptr_t) conn;
+		wr.next = NULL;
+		wr.sg_list = &sge;
+		wr.num_sge = 1;
+
+		sge.addr = (uintptr_t) conn->sync_buff;
+		sge.length = sizeof(uint16_t);
+		sge.lkey = conn->sync_mr->lkey;
+
+		TEST_NZ(ibv_post_recv(conn->qp, &wr, &bad_wr));
+	}
+}
+
+void printmultiple(connection *conn) {
+	char str[INET_ADDRSTRLEN];
+	printf("Client List:\n");
+	uint16_t num_clients = ntohs(*(conn->clientList_size_buff));
+
+	for (uint16_t i = 0; i < num_clients; i++) {
+		client *ct = conn->clientList_buff + (i * sizeof(client));
+		inet_ntop(AF_INET, &(ct->ip_addr.sin_addr), str, INET_ADDRSTRLEN);
+		printf("\tClient pgid = %"PRIx64"\n", be64toh(ct->pgid));
+		printf("\tClient rank = 0x%x\n", ntohs(ct->rank));
+		printf("\tClient IP = %s\n", str);
+		if (i < num_clients-1) printf("\n");
+	}
+}
+
+int on_connection(struct rdma_cm_id *id) {
+	connection *conn = (connection *) id->context;
+
+	struct sockaddr_in * addr_in = (struct sockaddr_in *) rdma_get_peer_addr(id);
 	char ipstr[INET_ADDRSTRLEN];
 	inet_ntop(AF_INET, &addr_in->sin_addr, ipstr, INET_ADDRSTRLEN);
 	uint16_t port = ntohs(rdma_get_dst_port(id));
-
 	printf("connected to %s:%hu\n", ipstr, port);
 
+	if (am_coord) {
+		printf("Posting client list size = %hd\n", comm_no);
+		post_client_list_size_send(conn);
+	} else {
+		mygid = be64toh(conn->id->route.addr.addr.ibaddr.sgid.global.interface_id);
+		printf("mygid = %"PRIx64"\n", mygid);
+	}
 	return 0;
+}
+
+void post_client_list_size_send() {
+	for (connectionList *clt = connections; clt; clt = clt->tail) {
+		connection *conn = clt->head;
+
+		struct ibv_send_wr wr, *bad_wr = NULL;
+		struct ibv_sge sge;
+		memset(&wr, 0, sizeof(struct ibv_send_wr));
+		wr.wr_id = (uintptr_t) conn;
+		wr.opcode = IBV_WR_SEND;
+		wr.sg_list = &sge;
+		wr.num_sge = 1;
+		wr.send_flags = IBV_SEND_SIGNALED;
+
+		sge.addr = (uintptr_t) conn->clientList_size_buff;
+		sge.length = sizeof(uint16_t);
+		sge.lkey = conn->clientList_size_mr->lkey;
+
+		TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
+	}
 }
 
 int on_disconnect(struct rdma_cm_id *id) {
@@ -237,11 +379,11 @@ int on_disconnect(struct rdma_cm_id *id) {
 
 	rdma_destroy_id(id);
 
-	return 1;
+	return 1; //should we try to recover?
 }
 
 //polls cqe from coord comp_channel, handles when communications happen
-void * poll_cq_fn(void *arg) {
+void *poll_cq_fn(void *arg) {
 	void *cq_context;//not used but function calls for it
 	struct ibv_cq *cq;
 	struct ibv_wc wc;
@@ -251,14 +393,87 @@ void * poll_cq_fn(void *arg) {
 		ibv_ack_cq_events(cq, 1);
 		TEST_NZ(ibv_req_notify_cq(cq, 0)); //request notification for next CQE
 
+		int status = 0;
 		while (ibv_poll_cq(cq, 1, &wc)) {
-			on_completion(&wc);
+			status = on_completion(&wc);
 		}
+
+		if (status) break;
 	}
+
+	return NULL;
 }
 
-void on_completion(struct ibv_wc *wc) {
-//TODO
+int on_completion(struct ibv_wc *wc) {
+	if (wc->status != IBV_WC_SUCCESS) {
+		printf("Work Completion FAILED, vendor error: %d, status: %d\n",
+				wc->vendor_err, wc->status);
+		die("on_completion: status is not IBV_WC_SUCCESS");
+	}
+
+	int status = 0;
+
+	switch (wc->opcode) {
+		case IBV_WC_SEND:
+			printf("Send successfull\n");
+			break;
+		case IBV_WC_RECV:
+			if (am_coord) {
+				status = coord_recv_completion(wc);
+			} else {
+				status = client_recv_completion(wc);
+			}
+			break;
+	}
+
+	return status;
+}
+
+int coord_recv_completion(struct ibv_wc *wc) {
+	connection *conn = (connection *) wc->wr_id;
+
+	printf("received sync msg\n");
+
+	if (conn-recv_state == RS_INIT) {
+		numm++;
+		printf("sending client list, num clients: %hd\n", comm_no);
+		post_client_list_send(conn);
+
+		if ((comm_no == MAX_CLIENTS) && ((numm + 1) == MAX_CLIENTS)) {
+			printf("All clients connected, starting mcast()\n");
+			mcast();
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+void post_client_list_send(connection *conn) {
+	struct ibv_send_wr wr, *bad_wr = NULL;
+	struct ibv_sge sge;
+	memset(&wr, 0, sizeof(struct ibv_send_wr));
+	wr.wr_id = (uintptr_t) conn;
+	wr.opcode = IBV_WR_SEND;
+	wr.sg_list = &sge;
+	wr.nume_sge = 1;
+	wr.send_flags = IBV_SEND_SIGNALED;
+
+	sge.addr = (uintptr_t) conn->clientList_buff;
+	sge.length = comm_no * sizeof(client);
+	sge.lkey = conn->clientList_mr->lkey;
+
+	TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
+}
+
+int client_recv_completion(struct ibv_wc *wc) {
+	connection *conn = (connection *) wc->wr_id;
+
+	if (conn->recv_state == RS_INIT) {
+
+	}
+
+	return 0;
 }
 
 void become_coord() {
@@ -290,6 +505,8 @@ void init_coord_connection() {
 	printf("resolving address to coordinator at %s:%s\n", DEF_COORD_ADDR, DEF_COORD_PORT);
 
 	freeaddrinfo(addr);
+
+	am_coord = false;
 }
 
 int get_completion(struct ibv_cq *cq) {
