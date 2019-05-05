@@ -2,7 +2,7 @@
 
 int main(int argc, char **argv) {
 	int op;
-	int rank = -1, root = -1, size = -1;
+	int rank = -1, root = -1;
 
 	char *bind_addr = NULL;
 
@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
 				rank = atoi(optarg);
 				break;
 			case 's':
-				size = atoi(optarg);
+				MAX_CLIENTS = atoi(optarg);
 				break;
 			case 'b':
 				bind_addr = strdup(optarg);
@@ -23,18 +23,18 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	if (size <= 0) {
-		printf("Must give a positive size for the group\n");
+	if (MAX_CLIENTS == 0) {
+		printf("Must give a positive size for the number of clients\n");
 		exit(1);
 	}
 
-	if (rank < 0 || rank >= size) {
-		printf("Must give a valid rank between [0, %d)\n", size);
+	if (rank < 0 || rank >= MAX_CLIENTS) {
+		printf("Must give a valid rank between [0, %d)\n", MAX_CLIENTS);
 		exit(1);
 	}
 
-	if (root < 0 || rank >= size) {
-		printf("Must give a valid root between [0, %d)\n", size);
+	if (root < 0 || rank >= MAX_CLIENTS) {
+		printf("Must give a valid root between [0, %d)\n", MAX_CLIENTS);
 		exit(1);
 	}
 
@@ -56,6 +56,44 @@ int main(int argc, char **argv) {
 	}
 
 	return 0;
+}
+
+void become_coord() {
+	struct sockaddr_in addr_in_coord;
+	memset(&addr_in_coord, 0, sizeof(addr_in_coord));
+	addr_in_coord.sin_family = AF_INET;
+	addr_in_coord.sin_port = htons((uint16_t) atoi(DEF_COORD_PORT));
+
+	TEST_Z(event_channel = rdma_create_event_channel());
+
+	TEST_NZ(rdma_create_id(event_channel, &coord_listener_id, NULL, RDMA_PS_TCP));
+	TEST_NZ(rdma_bind_addr(coord_listener_id, (struct sockaddr *)&addr_in_coord));
+	TEST_NZ(rdma_listen(coord_listener_id, 10)); // backlog=10 is arbitrary
+
+	uint16_t port = ntohs(rdma_get_src_port(coord_listener_id));
+	struct sockaddr_in *localaddr_in =
+		(struct sockaddr_in *) rdma_get_local_addr(coord_listener_id);
+	char ipstr[INET_ADDRSTRLEN];
+	inet_ntop(AF_INET, &localaddr_in->sin_addr, ipstr, INET_ADDRSTRLEN);
+
+	printf("I am become coordinator, worker of worlds!\n");
+	printf("listening on %s:%hu\n", ipstr, port);
+
+	am_coord = true;
+}
+
+void init_coord_connection(char *bind_addr) {
+	struct addrinfo *addrinf;
+	TEST_NZ(getaddrinfo(DEF_COORD_ADDR, DEF_COORD_PORT, NULL, &addrinf));
+
+	TEST_Z(event_channel = rdma_create_event_channel());
+	TEST_NZ(rdma_create_id(event_channel, &coord_connect_id, NULL, RDMA_PS_TCP));
+	TEST_NZ(rdma_resolve_addr(coord_connect_id, NULL, addrinf->ai_addr, TIMEOUT_IN_MS));
+
+	printf("resolving address to coordinator at %s:%s\n", DEF_COORD_ADDR, DEF_COORD_PORT);
+	freeaddrinfo(addrinf);
+
+	am_coord = false;
 }
 
 int on_event(struct rdma_cm_event *event) {
@@ -106,7 +144,22 @@ int on_addr_resolved(struct rdma_cm_id *id) {
 	conn->cm_id = id;
 	conn->qp = id->qp;
 
-	register_memory(conn);
+	printf("Registering size and sync memory regions\n");
+
+	if (!clientList_size_mr)
+		TEST_Z(clientList_size_mr = ibv_reg_mr(
+					coord_ctx->pd,
+					&clientList_size_buff,
+					sizeof(uint32_t),
+					IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
+
+	if (!sync_mr)
+		TEST_Z(sync_mr = ibv_reg_mr(
+					coord_ctx->pd,
+					&sync_buff,
+					sizeof(uint16_t),
+					IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
+
 	post_client_list_size_recv(conn);
 
 	TEST_NZ(rdma_resolve_route(id, TIMEOUT_IN_MS));
@@ -150,8 +203,10 @@ void build_qp_attr(struct ibv_qp_init_attr *qp_attr) {
 	printf("qp attributes built\n");
 }
 
+//TODO Not needed anymore?
+/*
 void register_memory(connection *conn) {
-	conn->clientList_size_buff = malloc(sizeof(uint64_t));
+	conn->clientList_size_buff = malloc(sizeof(uint32_t));
 	TEST_Z(conn->clientList_size_mr = ibv_reg_mr(
 				coord_ctx->pd,
 				conn->clientList_size_buff,
@@ -167,6 +222,7 @@ void register_memory(connection *conn) {
 
 	printf("memory registered\n");
 }
+*/
 
 void post_client_list_size_recv(connection *conn) {
 	struct ibv_recv_wr wr, *bad_wr = NULL;
@@ -177,9 +233,9 @@ void post_client_list_size_recv(connection *conn) {
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
 
-	sge.addr = (uintptr_t) conn->clientList_size_buff;
+	sge.addr = (uintptr_t) &clientList_size_buff;
 	sge.length = sizeof(uint32_t);
-	sge.lkey = conn->clientList_size_mr->lkey;
+	sge.lkey = clientList_size_mr->lkey;
 
 	TEST_NZ(ibv_post_recv(conn->qp, &wr, &bad_wr));
 
@@ -194,9 +250,9 @@ void post_client_list_recv(connection *conn) {
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
 
-	sge.addr = (uintptr_t)conn->clientList_buff;
-	sge.length = ntohl(*conn->clientList_size_buff) * sizeof(client);
-	sge.lkey = conn->clientList_mr->lkey;
+	sge.addr = (uintptr_t)clientList_buff;
+	sge.length = ntohl(clientList_size_buff) * sizeof(client);
+	sge.lkey = clientList_mr->lkey;
 
 	TEST_NZ(ibv_post_recv(conn->qp, &wr, &bad_wr));
 
@@ -226,6 +282,7 @@ int on_connect_request(struct rdma_cm_id *id) {
 	printf("received connection request from %s:%hu\n", ipstr, port);
 
 	if (first) {
+		//Build up server's client structure, before we handle client's
 		client *c = (client *) malloc(sizeof(client));
 		myclient = (client *) malloc(sizeof(client));
 
@@ -234,8 +291,8 @@ int on_connect_request(struct rdma_cm_id *id) {
 		c->rank = htons(comm_no++); //comm_no starts at 0
 		c->ip_addr = id->route.addr.src_sin;
 
-		memcpy(&myclient->pgid, &c->pgid,sizeof(uint64_t));
-		memcpy(&myclient->rank, &c->rank,sizeof(uint16_t));
+		memcpy(&myclient->pgid, &c->pgid, sizeof(uint64_t));
+		memcpy(&myclient->rank, &c->rank, sizeof(uint16_t));
 		memcpy(&myclient->ip_addr, &c->ip_addr, sizeof(struct sockaddr_in));
 
 		clients = ClientList(c, NULL);
@@ -261,52 +318,44 @@ int on_connect_request(struct rdma_cm_id *id) {
 	conn->send_state = SS_INIT;
 	conn->recv_state = RS_INIT;
 
-	uint32_t cl_size = comm_no * sizeof(client);
 	printf("comm_no: %d\n", comm_no);
-	if (comm_no == 2) {//first connection made
-		conn->clientList_size_buff = malloc(sizeof(uint32_t));
-		TEST_Z(conn->clientList_size_mr = ibv_reg_mr(
+
+	if (!clientList_size_mr)
+		TEST_Z(clientList_size_mr = ibv_reg_mr(
 					coord_ctx->pd,
-					conn->clientList_size_buff,
+					&clientList_size_buff,
 					sizeof(uint32_t),
 					IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
 
-		conn->clientList_buff = malloc(cl_size);
-		TEST_Z(conn->clientList_mr = ibv_reg_mr(
-					coord_ctx->pd,
-					conn->clientList_buff,
-					cl_size,
-					IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
+	uint32_t cl_size = comm_no * sizeof(client);
+	clientList_buff = (char *) realloc(clientList_buff, cl_size);
 
-	conn->sync_buff = malloc(sizeof(uint16_t));
-	TEST_Z(conn->sync_mr = ibv_reg_mr(
+	if (clientList_mr)
+		ibv_dereg_mr(clientList_mr);
+	TEST_Z(clientList_mr = ibv_reg_mr(
 				coord_ctx->pd,
-				conn->sync_buff,
-				sizeof(uint16_t),
+				clientList_buff,
+				cl_size,
 				IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
-	} else {
-		conn->clientList_buff = realloc(conn->clientList_buff, cl_size);
 
-		ibv_dereg_mr(conn->clientList_mr);
-
-		TEST_Z(conn->clientList_mr = ibv_reg_mr(
+	if (!sync_mr)
+		TEST_Z(sync_mr = ibv_reg_mr(
 					coord_ctx->pd,
-					conn->clientList_buff,
-					cl_size,
-					IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_LOCAL_WRITE));
-	}
+					&sync_buff,
+					sizeof(uint16_t),
+					IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
 
 	clients = ClientList(cl, clients);
 	int i = 0;
 	for (clientList *clt = clients; clt; clt = clt->tail) {
 		client *cc = clt->head;
-		memcpy(conn->clientList_buff + (i * sizeof(client)), cc, sizeof(client));
+		memcpy(clientList_buff + (i * sizeof(client)), cc, sizeof(client));
 		i++;
 	}
 
 	connections = ConnectionList(conn, connections);
-	*(conn->clientList_size_buff) = htonl(comm_no);
-	printmultiple(conn);
+	clientList_size_buff = htonl(comm_no);
+	print_client_list();
 	post_sync_msg_receives();
 
 	struct rdma_conn_param cm_params;
@@ -328,9 +377,9 @@ void post_sync_msg_receives() {
 		wr.sg_list = &sge;
 		wr.num_sge = 1;
 
-		sge.addr = (uintptr_t) conn->sync_buff;
+		sge.addr = (uintptr_t) &sync_buff;
 		sge.length = sizeof(uint16_t);
-		sge.lkey = conn->sync_mr->lkey;
+		sge.lkey = sync_mr->lkey;
 
 		TEST_NZ(ibv_post_recv(conn->qp, &wr, &bad_wr));
 	}
@@ -340,7 +389,7 @@ void post_sync_msg_send(connection *conn) {
 	struct ibv_send_wr wr, *bad_wr = NULL;
 	struct ibv_sge sge;
 
-	*conn->sync_buff = htons(1);
+	sync_buff = htons(1);
 
 	memset(&wr, 0, sizeof(struct ibv_send_wr));
 	wr.wr_id = (uintptr_t) conn;
@@ -349,28 +398,27 @@ void post_sync_msg_send(connection *conn) {
 	wr.num_sge = 1;
 	wr.send_flags = IBV_SEND_SIGNALED;
 
-	sge.addr = (uintptr_t)conn->sync_buff;
+	sge.addr = (uintptr_t)&sync_buff;
 	sge.length = sizeof(uint16_t);
-	sge.lkey = conn->sync_mr->lkey;
+	sge.lkey = sync_mr->lkey;
 
 	TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
 
 	printf("posting sync msg send\n");
 }
 
-void printmultiple(connection *conn) {
+void print_client_list() {
 	char str[INET_ADDRSTRLEN];
 	printf("Client List:\n");
-	uint32_t num_clients = ntohl(*conn->clientList_size_buff);
+	uint32_t num_clients = ntohl(clientList_size_buff);
 
 	for (uint32_t i = 0; i < num_clients; i++) {
-		client *ct = (client *)(conn->clientList_buff + (i * sizeof(client)));
+		client *ct = (client *)(clientList_buff + (i * sizeof(client)));
 		inet_ntop(AF_INET, &(ct->ip_addr.sin_addr), str, INET_ADDRSTRLEN);
 
 		printf("  Client pgid = %"PRIx64"\n", be64toh(ct->pgid));
 		printf("  Client rank = 0x%x\n", ntohs(ct->rank));
-		printf("  Client IP = %s\n", str);
-		if (i < num_clients-1) printf("\n");
+		printf("  Client IP = %s\n\n", str);
 	}
 }
 
@@ -405,9 +453,9 @@ void post_client_list_size_send() {
 		wr.num_sge = 1;
 		wr.send_flags = IBV_SEND_SIGNALED;
 
-		sge.addr = (uintptr_t) conn->clientList_size_buff;
+		sge.addr = (uintptr_t) &clientList_size_buff;
 		sge.length = sizeof(uint32_t);
-		sge.lkey = conn->clientList_size_mr->lkey;
+		sge.lkey = clientList_size_mr->lkey;
 
 		TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
 	}
@@ -419,17 +467,15 @@ int on_disconnect(struct rdma_cm_id *id) {
 
 	rdma_destroy_qp(id);
 
-	if (conn->clientList_size_buff) {
-		ibv_dereg_mr(conn->clientList_size_mr);
-		free(conn->clientList_size_buff);
+	if (clientList_size_mr) {
+		ibv_dereg_mr(clientList_size_mr);
 	}
-	if (conn->clientList_buff) {
-		ibv_dereg_mr(conn->clientList_mr);
-		free(conn->clientList_buff);
+	if (clientList_buff) {
+		ibv_dereg_mr(clientList_mr);
+		free(clientList_buff);
 	}
-	if (conn->sync_buff) {
-		ibv_dereg_mr(conn->sync_mr);
-		free(conn->sync_buff);
+	if (sync_mr) {
+		ibv_dereg_mr(sync_mr);
 	}
 
 	free(conn);
@@ -523,9 +569,9 @@ void post_client_list_send(connection *conn) {
 	wr.num_sge = 1;
 	wr.send_flags = IBV_SEND_SIGNALED;
 
-	sge.addr = (uintptr_t) conn->clientList_buff;
-	sge.length = ntohl(*conn->clientList_size_buff) * sizeof(client);
-	sge.lkey = conn->clientList_mr->lkey;
+	sge.addr = (uintptr_t) clientList_buff;
+	sge.length = ntohl(clientList_size_buff) * sizeof(client);
+	sge.lkey = clientList_mr->lkey;
 
 	TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
 }
@@ -534,75 +580,42 @@ int client_recv_completion(struct ibv_wc *wc) {
 	connection *conn = (connection *) wc->wr_id;
 
 	if (conn->recv_state == RS_INIT) {
-		printf("Received new num clients: %u\n", ntohl(*conn->clientList_size_buff));
+		printf("Received new num clients: %u\n", ntohl(clientList_size_buff));
 		conn->recv_state = RS_SIZE;
 		reg_client_list_mem(conn);
 		post_client_list_recv(conn);
 		post_sync_msg_send(conn);
 	} else if (conn->recv_state == RS_SIZE) {
 		printf("Received new client list\n");
-		printmultiple(conn);
+		print_client_list();
+		//mcast? if not restart process
+		uint32_t num_clients = ntohl(clientList_size_buff);
+		if (num_clients == MAX_CLIENTS) {
+			mcast();
+		} else {
+			conn->recv_state = RS_INIT;
+			post_client_list_size_recv(conn);
+		}
 	}
 
 	return 0;
 }
 
 void reg_client_list_mem(connection *conn) {
-	uint64_t num_clients = ntohl(*conn->clientList_size_buff);
-	uint64_t client_list_size = num_clients * sizeof(client);
+	uint32_t num_clients = ntohl(clientList_size_buff);
+	uint64_t cl_size = num_clients * sizeof(client);
 
-	if (!conn->clientList_buff) {//has not been allocated before
-		conn->clientList_buff = (char *)malloc(client_list_size);
-	} else {
-		conn->clientList_buff = (char *)realloc(conn->clientList_buff, client_list_size);
-		ibv_dereg_mr(conn->clientList_mr);
-	}
+	clientList_buff = (char *) realloc(clientList_buff, cl_size);
+	if (clientList_mr)
+		ibv_dereg_mr(clientList_mr);
 
-	TEST_Z(conn->clientList_mr = ibv_reg_mr(
+	TEST_Z(clientList_mr = ibv_reg_mr(
 				coord_ctx->pd,
-				conn->clientList_buff,
-				client_list_size,
+				clientList_buff,
+				cl_size,
 				IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
 
 	printf("registered client list memory\n");
-}
-
-struct sockaddr_in addr_in_coord;
-void become_coord() {
-	memset(&addr_in_coord, 0, sizeof(addr_in_coord));
-	addr_in_coord.sin_family = AF_INET;
-	addr_in_coord.sin_port = htons((uint16_t) atoi(DEF_COORD_PORT));
-
-	TEST_Z(event_channel = rdma_create_event_channel());
-
-	TEST_NZ(rdma_create_id(event_channel, &coord_listener_id, NULL, RDMA_PS_TCP));
-	TEST_NZ(rdma_bind_addr(coord_listener_id, (struct sockaddr *)&addr_in_coord));
-	TEST_NZ(rdma_listen(coord_listener_id, 10)); // backlog=10 is arbitrary
-
-	uint16_t port = ntohs(rdma_get_src_port(coord_listener_id));
-	struct sockaddr_in *localaddr_in =
-		(struct sockaddr_in *) rdma_get_local_addr(coord_listener_id);
-	char ipstr[INET_ADDRSTRLEN];
-	inet_ntop(AF_INET, &localaddr_in->sin_addr, ipstr, INET_ADDRSTRLEN);
-
-	printf("I am become coordinator, worker of worlds!\n");
-	printf("listening on %s:%hu\n", ipstr, port);
-
-	am_coord = true;
-}
-
-struct addrinfo *addrinf;
-void init_coord_connection(char *bind_addr) {
-	TEST_NZ(getaddrinfo(DEF_COORD_ADDR, DEF_COORD_PORT, NULL, &addrinf));
-
-	TEST_Z(event_channel = rdma_create_event_channel());
-	TEST_NZ(rdma_create_id(event_channel, &coord_connect_id, NULL, RDMA_PS_TCP));
-	TEST_NZ(rdma_resolve_addr(coord_connect_id, NULL, addrinf->ai_addr, TIMEOUT_IN_MS));
-
-	printf("resolving address to coordinator at %s:%s\n", DEF_COORD_ADDR, DEF_COORD_PORT);
-	freeaddrinfo(addrinf);
-
-	am_coord = false;
 }
 
 int get_completion(struct ibv_cq *cq) {

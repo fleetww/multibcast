@@ -22,7 +22,6 @@
 
 #define DEFAULT_MSG_COUNT 1
 #define DEFAULT_MSG_LENGTH 2048
-#define MAX_CLIENTS 4
 
 #define BUFFER_SIZE 1024
 #define TIMEOUT_IN_MS 500
@@ -33,11 +32,15 @@ fprintf(stderr, "%s returned %d errno %d\n", verb, ret, errno)
 #define TEST_NZ(x) do { if ( (x)) die("error: " #x " failed (returned non-zero)." ); } while (0)
 #define TEST_Z(x)  do { if (!(x)) die("error: " #x " failed (returned zero/null)."); } while (0)
 
+uint32_t MAX_CLIENTS = 0;
+
 typedef struct client {
 	uint64_t pgid;
 	uint16_t rank;
 	struct sockaddr_in ip_addr;
 }__attribute__ ((packed)) client; //packed because we send these across network
+
+client *myclient = NULL;
 
 typedef struct clientList {
 	client *head;
@@ -53,7 +56,6 @@ clientList *ClientList(client *head, clientList *tail) {
 
 clientList *clients = NULL;
 
-client *myclient = NULL;
 uint64_t mygid;
 uint16_t comm_no = 0;
 uint32_t numm=0;
@@ -77,22 +79,21 @@ struct coord_context {
 
 struct coord_context *coord_ctx;
 
+uint32_t clientList_size_buff;
+struct ibv_mr *clientList_size_mr = NULL;
+
+char *clientList_buff = NULL;
+struct ibv_mr *clientList_mr = NULL;
+
+uint16_t sync_buff;
+struct ibv_mr *sync_mr = NULL;
+
 //used for coordinator communication
 typedef struct connection {
 	uint16_t conn_id;
 
 	struct rdma_cm_id *cm_id;
 	struct ibv_qp *qp;
-
-	//we will replace this with a ringed memory buffer
-	uint32_t *clientList_size_buff;
-	struct ibv_mr *clientList_size_mr;
-
-	char *clientList_buff;
-	struct ibv_mr *clientList_mr;
-
-	uint16_t *sync_buff;
-	struct ibv_mr *sync_mr;
 
 	enum {
 		RS_INIT,
@@ -162,7 +163,7 @@ void build_context(struct ibv_context *verbs);
 void build_qp_attr(struct ibv_qp_init_attr *qp_attr);
 void register_memory(connection *conn);
 void reg_client_list_mem(connection *conn);
-void printmultiple(connection *conn);
+void print_client_list();
 void post_sync_msg_receives();
 void post_sync_msg_send(connection *conn);
 void post_receives();
