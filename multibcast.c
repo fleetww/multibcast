@@ -2,17 +2,15 @@
 
 int main(int argc, char **argv) {
 	int op;
-	int rank = -1, root = -1;
-
 	char *bind_addr = NULL;
 
 	while ((op = getopt(argc, argv, "r:n:s:b:")) != -1) {
 		switch (op) {
 			case 'r':
-				root = atoi(optarg);
+				ROOT = atoi(optarg);
 				break;
 			case 'n':
-				rank = atoi(optarg);
+				RANK = atoi(optarg);
 				break;
 			case 's':
 				MAX_CLIENTS = atoi(optarg);
@@ -28,17 +26,17 @@ int main(int argc, char **argv) {
 		exit(1);
 	}
 
-	if (rank < 0 || rank >= MAX_CLIENTS) {
+	if (RANK < 0 || RANK >= MAX_CLIENTS) {
 		printf("Must give a valid rank between [0, %d)\n", MAX_CLIENTS);
 		exit(1);
 	}
 
-	if (root < 0 || rank >= MAX_CLIENTS) {
+	if (ROOT < 0 || RANK >= MAX_CLIENTS) {
 		printf("Must give a valid root between [0, %d)\n", MAX_CLIENTS);
 		exit(1);
 	}
 
-	if (!rank) {//default coordinator
+	if (!RANK) {//default coordinator
 		become_coord();
 	} else {
 		init_coord_connection(bind_addr);
@@ -499,6 +497,7 @@ void *poll_cq_fn(void *arg) {
 		int status = 0;
 		while (ibv_poll_cq(cq, 1, &wc)) {
 			status = on_completion(&wc);
+			if (status) break;
 		}
 
 		if (status) break;
@@ -534,9 +533,147 @@ int on_completion(struct ibv_wc *wc) {
 	return status;
 }
 
+typedef struct mcontext {
+	//User parameters
+	int sender;
+	char *bind_addr;
+	char *mcast_addr;
+	char *server_port;
+	int msg_count;
+	int msg_length;
+	//Resources
+	struct sockaddr mcast_sockaddr;
+	struct rdma_event_channel *channel;
+	struct rdma_cm_id *id;
+	struct ibv_pd *pd;
+	struct ibv_cq *cq;
+	char *buff;
+	struct ibv_mr *mr;
+	struct ibv_ah *ah;
+} mcontext;
+
+int resolve_addr(mcontext *mtx);
+
 void mcast() {
 	printf("Starting multicast test\n");
-	return;
+
+	struct mcontext mtx;
+	memset(&mtx, 0, sizeof(struct mcontext));
+	mtx.sender = ROOT;
+	mtx.bind_addr = "0.0.0.0";
+	mtx.mcast_addr = MULTICAST_ADDR;
+	mtx.server_port = MULTICAST_PORT;
+	mtx.msg_count = DEFAULT_MSG_COUNT;
+	mtx.msg_length = DEFAULT_MSG_LENGTH;
+	TEST_Z(mtx.channel = rdma_create_event_channel());
+	TEST_NZ(rdma_create_id(mtx.channel, &mtx.id, NULL, RDMA_PS_UDP));
+
+	TEST_NZ(resolve_addr(&mtx));
+
+	struct ibv_port_attr port_attr;
+	TEST_NZ(ibv_query_port(mtx.id->verbs, mtx.id->port_num, &port_attr));
+	int active_mtu = 1 << (port_attr.active_mtu + 7);
+	if (mtx.msg_length > active_mtu) {
+		printf("buffer length %d is larger than active mtu %d\n", mtx.msg_length, active_mtu);
+		exit(EXIT_FAILURE);
+	}
+
+	create_resources(&mtx);
+
+	if (mtx.sender != RANK) {
+		for (int i = 0; i < mtx.msg_count; i++) {
+			rdma_post_recv(mtx.id, NULL, mtx.buf + i)
+		}
+	}
+}
+
+int create_resources(mcontext *mtx) {
+	struct ibv_qp_init_attr attr;
+	memset(&attr, 0, sizeof(struct ibv_qp_init_attr));
+	if (!mtx->pd) {
+		TEST_Z(mtx->pd = ibv_alloc_pd(mtx->id->verbs));
+	}
+
+	TEST_Z(mtx->cq = ibv_create_cq(mtx->id->verbs, 2, 0, 0, 0));
+
+	attr.qp_type = IBV_QPT_UD;
+	attr.send_cq = mtx->cq;
+	attr.recv_cq = mtx->cq;
+	attr.cap.max_send_wr = mtx->msg_count;
+	attr.cap.max_recv_wr = mtx->msg_count;
+	attr.cap.max_send_sge = 1;
+	attr.cap.max_recv_sge = 1;
+	TEST_NZ(rdma_create_qp(mtx->id, mtx->pd, &attr));
+
+	//The receiver must allow enough space in the receive buffer for the GRH
+	uint32_t buff_size = DEFAULT_MSG_LENGTH + (mtx->sender == RANK)	? 0 : sizeof(struct ibv_grh);
+	mtx->buff = calloc(0, buff_size);
+	TEST_Z(mtx->mr = rdma_reg_msgs(mtx->id, mtx->buff, buff_size));
+
+	return 0;
+}
+
+int resolve_addr(mcontext *mtx) {
+	struct rdma_addrinfo *bind_rai = NULL, *mcast_rai = NULL, hints;
+
+	memset(&hints, 0, sizeof (hints));
+	hints.ai_port_space = RDMA_PS_UDP;
+	if (mtx->bind_addr) {
+		hints.ai_flags = RAI_PASSIVE;
+		TEST_NZ(rdma_getaddrinfo(mtx->bind_addr, NULL, &hints, &bind_rai));
+	}
+
+	hints.ai_flags = 0;
+	TEST_NZ(rdma_getaddrinfo(mtx->mcast_addr, NULL, &hints, &mcast_rai));
+
+	if (mtx->bind_addr) {
+		/* bind to a specific adapter if requested to do so */
+		TEST_NZ(rdma_bind_addr(mtx->id, bind_rai->ai_src_addr));
+		/* A PD is created when we bind. Copy it to the context so it can
+		 * be used later on */
+		mtx->pd = mtx->id->pd;
+	}
+
+	TEST_NZ(rdma_resolve_addr(
+				mtx->id,
+				(bind_rai) ? bind_rai->ai_src_addr : NULL,
+				mcast_rai->ai_dst_addr,
+				2000));
+
+	TEST_NZ(get_cm_event(mtx->channel, RDMA_CM_EVENT_ADDR_RESOLVED, NULL));
+
+	memcpy(&mtx->mcast_sockaddr,
+			mcast_rai->ai_dst_addr,
+			sizeof (struct sockaddr));
+
+	return 0;
+}
+
+int get_cm_event(struct rdma_event_channel *channel,
+		enum rdma_cm_event_type type,
+		struct rdma_cm_event **out_ev) {
+	int ret = 0;
+
+	struct rdma_cm_event *event = NULL;
+	ret = rdma_get_cm_event(channel, &event);
+	if (ret) {
+		VERB_ERR("rdma_get_cm_event", ret);
+		return -1;
+	}
+
+	/* Verify the event is the expected type */
+	if (event->event != type) {
+		printf("get_cm_event: \tevent: %s, status: %d\n",
+				rdma_event_str(event->event), event->status);
+		ret = -1;
+	}
+
+	/* Pass the event back to the user if requested */
+	if (!out_ev)
+		rdma_ack_cm_event(event);
+	else
+		*out_ev = event;
+	return ret;
 }
 
 int coord_recv_completion(struct ibv_wc *wc) {

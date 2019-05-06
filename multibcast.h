@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <rdma/rdma_cma.h>
+#include <rdma/rdma_verbs.h>
 
 #define DEF_COORD_ADDR "192.168.143.141"
 #define DEF_COORD_PORT "20079" //rdma ops use strings to specify port
@@ -29,10 +30,14 @@
 #define VERB_ERR(verb, ret) \
 fprintf(stderr, "%s returned %d errno %d\n", verb, ret, errno)
 
+//IF NOT ZERO, DIE
 #define TEST_NZ(x) do { if ( (x)) die("error: " #x " failed (returned non-zero)." ); } while (0)
+//IF ZERO, DIE
 #define TEST_Z(x)  do { if (!(x)) die("error: " #x " failed (returned zero/null)."); } while (0)
 
 uint32_t MAX_CLIENTS = 0;
+int ROOT = -1;
+int RANK = -1;
 
 typedef struct client {
 	uint64_t pgid;
@@ -121,15 +126,16 @@ connectionList *ConnectionList(connection *head, connectionList *tail) {
 
 connectionList *connections = NULL;
 
+/*
 struct mcontext {
-	/* User parameters */
+	// User parameters
 	int sender;
 	char *bind_addr;
 	char *mcast_addr;
 	char *server_port;
 	int msg_count;
 	int msg_length;
-	/* Resources */
+	// Resources
 	struct sockaddr mcast_sockaddr;
 	struct rdma_cm_id *id;
 	struct rdma_event_channel *channel;
@@ -144,6 +150,7 @@ struct mcontext {
 };
 
 int resolve_addr(struct mcontext *ctx);
+*/
 
 int on_event(struct rdma_cm_event *event);
 int on_addr_resolved(struct rdma_cm_id *id);
@@ -173,6 +180,9 @@ void post_client_list_size_recv(connection *conn);
 void post_client_list_recv(connection *conn);
 
 void mcast();
+int get_cm_event(struct rdma_event_channel *channel,
+		enum rdma_cm_event_type type,
+		struct rdma_cm_event **out_ev);
 
 void become_coord();
 void init_coord_connection(char *bind_addr);
