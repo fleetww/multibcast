@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
+#include <infiniband/arch.h>
 
 #define DEF_COORD_ADDR "192.168.143.141"
 #define DEF_COORD_PORT "20079" //rdma ops use strings to specify port
@@ -22,7 +23,7 @@
 #define ACK_PORT "65079"
 
 #define DEFAULT_MSG_COUNT 1
-#define DEFAULT_MSG_LENGTH 2048
+#define MSG_STR_LENGTH 1024
 
 #define BUFFER_SIZE 1024
 #define TIMEOUT_IN_MS 500
@@ -126,31 +127,44 @@ connectionList *ConnectionList(connection *head, connectionList *tail) {
 
 connectionList *connections = NULL;
 
-/*
-struct mcontext {
-	// User parameters
+typedef struct mcontext {
+	//User parameters
 	int sender;
 	char *bind_addr;
 	char *mcast_addr;
 	char *server_port;
 	int msg_count;
 	int msg_length;
-	// Resources
+
+	//Resources
 	struct sockaddr mcast_sockaddr;
-	struct rdma_cm_id *id;
 	struct rdma_event_channel *channel;
+	struct rdma_cm_id *id;
 	struct ibv_pd *pd;
 	struct ibv_cq *cq;
 	struct ibv_mr *mr;
-	char *buf;
 	struct ibv_ah *ah;
+	char *buff;
 	uint32_t remote_qpn;
 	uint32_t remote_qkey;
-	pthread_t cm_thread;
-};
 
-int resolve_addr(struct mcontext *ctx);
-*/
+	pthread_t cm_thread;
+} mcontext;
+
+struct message{
+	uint16_t msg_num;
+	char msg[MSG_STR_LENGTH];
+}__attribute__ ((packed));
+
+void multicast();
+void multicast_ack_cast();
+int get_cm_event(struct rdma_event_channel *channel,
+		enum rdma_cm_event_type type,
+		struct rdma_cm_event **out_ev);
+int create_resources(mcontext *mtx);
+int resolve_addr(mcontext *mtx);
+void *cm_thread(void *arg);
+int post_multicast_send(mcontext *ctx, int msg_num);
 
 int on_event(struct rdma_cm_event *event);
 int on_addr_resolved(struct rdma_cm_id *id);
@@ -178,11 +192,6 @@ void post_client_list_size_send();
 void post_client_list_send(connection *conn);
 void post_client_list_size_recv(connection *conn);
 void post_client_list_recv(connection *conn);
-
-void mcast();
-int get_cm_event(struct rdma_event_channel *channel,
-		enum rdma_cm_event_type type,
-		struct rdma_cm_event **out_ev);
 
 void become_coord();
 void init_coord_connection(char *bind_addr);

@@ -533,28 +533,8 @@ int on_completion(struct ibv_wc *wc) {
 	return status;
 }
 
-typedef struct mcontext {
-	//User parameters
-	int sender;
-	char *bind_addr;
-	char *mcast_addr;
-	char *server_port;
-	int msg_count;
-	int msg_length;
-	//Resources
-	struct sockaddr mcast_sockaddr;
-	struct rdma_event_channel *channel;
-	struct rdma_cm_id *id;
-	struct ibv_pd *pd;
-	struct ibv_cq *cq;
-	char *buff;
-	struct ibv_mr *mr;
-	struct ibv_ah *ah;
-} mcontext;
 
-int resolve_addr(mcontext *mtx);
-
-void mcast() {
+void multicast() {
 	printf("Starting multicast test\n");
 
 	struct mcontext mtx;
@@ -564,7 +544,7 @@ void mcast() {
 	mtx.mcast_addr = MULTICAST_ADDR;
 	mtx.server_port = MULTICAST_PORT;
 	mtx.msg_count = DEFAULT_MSG_COUNT;
-	mtx.msg_length = DEFAULT_MSG_LENGTH;
+	mtx.msg_length = sizeof(struct message);
 	TEST_Z(mtx.channel = rdma_create_event_channel());
 	TEST_NZ(rdma_create_id(mtx.channel, &mtx.id, NULL, RDMA_PS_UDP));
 
@@ -582,9 +562,121 @@ void mcast() {
 
 	if (mtx.sender != RANK) {
 		for (int i = 0; i < mtx.msg_count; i++) {
-			rdma_post_recv(mtx.id, NULL, mtx.buf + i)
+			//rdma_post_recv(mtx.id, NULL, mtx.buff + i)
+			TEST_NZ(rdma_post_recv(mtx.id,
+						NULL,
+						mtx.buff + (i * (mtx.msg_length + sizeof(struct ibv_grh))),
+						mtx.msg_length + sizeof(struct ibv_grh),
+						mtx.mr));
 		}
 	}
+
+	TEST_NZ(rdma_join_multicast(mtx.id, &mtx.mcast_sockaddr, NULL));
+	printf("Joined multicast group\n");
+	struct rdma_cm_event *mevent;
+	TEST_NZ(get_cm_event(mtx.channel, RDMA_CM_EVENT_MULTICAST_JOIN, &mevent));
+	mtx.remote_qpn = mevent->param.ud.qp_num;
+	mtx.remote_qkey = mevent->param.ud.qkey;
+
+	if (mtx.sender == ROOT) {
+		TEST_Z(mtx.ah = ibv_create_ah(mtx.pd, &mevent->param.ud.ah_attr));
+	}
+	rdma_ack_cm_event(mevent);
+
+	pthread_create(&mtx.cm_thread, NULL, cm_thread, &mtx);
+
+	if (mtx.sender != ROOT) {
+		printf("Waiting for multicast messages...\n");
+	}
+	for (int i = 0; i < mtx.msg_count; i++) {
+		if (mtx.sender == ROOT) {
+			post_multicast_send(&mtx, i);
+		}
+
+		get_completion(mtx.cq);
+		if (mtx.sender == ROOT) {
+			printf("Sent multicast message %d\n", i);
+		} else {
+			printf("Received message %d\n", i);
+		}
+
+		multicast_ack_cast();
+	}
+}
+
+int nextPowerOf2(uint16_t n){
+	int p=1;
+	while(p<n)
+		p<<=1;
+
+	return p;
+}
+
+void multicast_ack_cast() {
+	printf("Inside multicast ack cast\n");
+
+	bool isPow2 = (MAX_CLIENTS != 0) && ((MAX_CLIENTS & (MAX_CLIENTS - 1)) == 0);
+
+	uint32_t loopcnt;
+	if (isPow2)
+		uint32_t loopcnt = (int) log2((double)MAX_CLIENTS);
+	else
+		loopcnt = (int)log2(nextPowerOf2(MAX_CLIENTS));
+
+	for (int i = 0; i < loopcnt; i++) {
+		if ((RANK & ((1 << (i+1)) - 1)) == 0)
+			TEST_NZ(servmethod(isPow2, loopcnt, i));
+		if ((RANK & ((1 << (i+1)) - 1)) == 1 << i)
+			TEST_NZ(connectmethod(i));
+	}
+}
+
+int post_multicast_send(mcontext *mtx, int msg_num) {
+	struct ibv_send_wr wr, *bad_wr = NULL;
+	struct ibv_sge sge;
+
+	struct message msg;
+	msg.msg_num = htons(msg_num);
+	snprintf(msg.msg, MSG_STR_LENGTH, "message %d from server", msg_num);
+	memcpy(mtx->buff, &msg, sizeof(struct message));
+
+	memset(&wr, 0, sizeof(struct ibv_send_wr));
+	wr.wr_id = 0;
+	wr.opcode = IBV_WR_SEND_WITH_IMM;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+	wr.send_flags = IBV_SEND_SIGNALED;
+	// Multicast requires that the message is sent with immediate data
+	// and that the QP number is the contents of the immediate data
+	wr.imm_data = htonl(mtx->id->qp->qp_num);
+	wr.wr.ud.ah = mtx->ah;
+	wr.wr.ud.remote_qpn = mtx->remote_qpn;
+	wr.wr.ud.remote_qkey = mtx->remote_qkey;
+
+	sge.length = mtx->msg_length;
+	sge.lkey = mtx->mr->lkey;
+	sge.addr = (uintptr_t) mtx->buff;
+
+	printf("Sending message %d:\n\t\"%s\"\n", msg_num, msg.msg);
+	TEST_NZ(ibv_post_send(mtx->id->qp, &wr, &bad_wr));
+
+	return 0;
+}
+
+void *cm_thread(void *arg) {
+	struct rdma_cm_event *event;
+	mcontext *mtx = (mcontext *) arg;
+
+	while (1) {
+		TEST_NZ(rdma_get_cm_event(mtx->channel, &event));
+
+		printf("event %s, status %d\n",
+				rdma_event_str(event->event), event->status);
+
+		rdma_ack_cm_event(event);
+	}
+
+	return NULL;
 }
 
 int create_resources(mcontext *mtx) {
@@ -606,7 +698,9 @@ int create_resources(mcontext *mtx) {
 	TEST_NZ(rdma_create_qp(mtx->id, mtx->pd, &attr));
 
 	//The receiver must allow enough space in the receive buffer for the GRH
-	uint32_t buff_size = DEFAULT_MSG_LENGTH + (mtx->sender == RANK)	? 0 : sizeof(struct ibv_grh);
+	uint32_t msg_size = mtx->msg_length + ((mtx->sender == RANK) ? 0 : sizeof(struct ibv_grh));
+	uint32_t buff_size = msg_size * mtx->msg_count;
+	//uint32_t buff_size = DEFAULT_MSG_LENGTH + (mtx->sender == RANK)	? 0 : sizeof(struct ibv_grh);
 	mtx->buff = calloc(0, buff_size);
 	TEST_Z(mtx->mr = rdma_reg_msgs(mtx->id, mtx->buff, buff_size));
 
@@ -687,8 +781,8 @@ int coord_recv_completion(struct ibv_wc *wc) {
 		post_client_list_send(conn);
 
 		if ((comm_no == MAX_CLIENTS) && ((numm + 1) == MAX_CLIENTS)) {
-			printf("All clients connected, starting mcast()\n");
-			mcast();
+			printf("All clients connected, starting multicast()\n");
+			multicast();
 			return 1;
 		}
 	}
@@ -728,7 +822,7 @@ int client_recv_completion(struct ibv_wc *wc) {
 		//mcast? if not restart process
 		uint32_t num_clients = ntohl(clientList_size_buff);
 		if (num_clients == MAX_CLIENTS) {
-			mcast();
+			multicast();
 		} else {
 			conn->recv_state = RS_INIT;
 			post_client_list_size_recv(conn);
